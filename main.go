@@ -149,7 +149,7 @@ func main() {
 	// ********************************************************************************
 	log.FromContext(ctx).Infof("executing phase 3: creating icmp server ipam")
 	// ********************************************************************************
-	_, ipnet, err := net.ParseCIDR(config.CidrPrefix)
+	baseip, ipnet, err := net.ParseCIDR(config.CidrPrefix)
 	if err != nil {
 		log.FromContext(ctx).Fatalf("error parsing cidr: %+v", err)
 	}
@@ -165,7 +165,9 @@ func main() {
 		endpoint.WithName(config.Name),
 		endpoint.WithAuthorizeServer(authorize.NewServer()),
 		endpoint.WithAdditionalFunctionality(
+			vl3_nse.NewVl3IpExcludeServer(ipnet, baseip),
 			point2pointipam.NewServer(ipnet),
+			vl3_nse.NewServer(ipnet),
 			mechanisms.NewServer(map[string]networkservice.NetworkServiceServer{
 				memif.MECHANISM: chain.NewNetworkServiceServer(
 					sendfd.NewServer(),

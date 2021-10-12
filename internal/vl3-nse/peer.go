@@ -143,7 +143,7 @@ func (n *NsePeering) DoNSEPeering(nseRegistryClient registry.NetworkServiceEndpo
 		if nse.Name != n.selfNseName {
 			log.Default().Infof("Found peer NSE %s", nse.Name)
 			n.ProcessPeer(nse)
-			break
+			//break
 		} else {
 			log.Default().Infof("Found my NSE %s", nse.Name)
 		}
@@ -174,12 +174,12 @@ func (n *NsePeering) doNsConnect(nse *registry.NetworkServiceEndpoint) error {
 	u := nsurl.NSURL(*netSvcUrl)
 	mech := u.Mechanism()
 	if mech.Type != memif.MECHANISM {
-		log.FromContext(ctx).Errorf("mechanism type: %v is not supproted", mech.Type)
-		return fmt.Errorf("mechanism type: %v is not supproted", mech.Type)
+		log.FromContext(ctx).Errorf("mechanism type: %v is not supported", mech.Type)
+		return fmt.Errorf("mechanism type: %v is not supported", mech.Type)
 	}
 	request := &networkservice.NetworkServiceRequest{
 		Connection: &networkservice.Connection{
-			NetworkService: u.NetworkService(),
+			//NetworkService: u.NetworkService(),
 			Labels:         u.Labels(),
 			NetworkServiceEndpointName: nse.Name,
 		},

@@ -7,6 +7,7 @@ import (
 	_ "github.com/edwarnicke/grpcfd"
 	_ "github.com/edwarnicke/vpphelper"
 	_ "github.com/kelseyhightower/envconfig"
+	_ "github.com/golang/protobuf/ptypes/empty"
 	_ "github.com/networkservicemesh/api/pkg/api/networkservice"
 	_ "github.com/networkservicemesh/api/pkg/api/registry"
 	_ "github.com/networkservicemesh/sdk-vpp/pkg/networkservice/connectioncontext"
