@@ -15,7 +15,7 @@ type vl3IpExcludeServer struct {
 	reserveAddrs []net.IP
 }
 
-// NewServer - creates a new NetworkServiceServer chain element that implements IPAM service.
+// NewServer - creates a new NetworkServiceServer chain element that reserves IPs from IPAM service.
 func NewVl3IpExcludeServer(ipamPrefix *net.IPNet, reservedIps ...net.IP) networkservice.NetworkServiceServer {
 	return &vl3IpExcludeServer{
 		ipamPrefix: ipamPrefix,

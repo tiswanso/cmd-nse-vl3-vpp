@@ -20,7 +20,18 @@ package main
 
 import (
 	"context"
+	"fmt"
+	nested "github.com/antonfisher/nested-logrus-formatter"
+	"github.com/edwarnicke/grpcfd"
+	"github.com/edwarnicke/vpphelper"
+	"github.com/kelseyhightower/envconfig"
 	vl3_nse "github.com/networkservicemesh/cmd-nse-vl3-vpp/internal/vl3-nse"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"io/ioutil"
 	"net"
 	"net/url"
@@ -29,16 +40,6 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
-	"github.com/pkg/errors"
-	"github.com/kelseyhightower/envconfig"
-	nested "github.com/antonfisher/nested-logrus-formatter"
-	"github.com/edwarnicke/grpcfd"
-	"github.com/edwarnicke/vpphelper"
-	"github.com/sirupsen/logrus"
-	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
-	"github.com/spiffe/go-spiffe/v2/workloadapi"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	registryapi "github.com/networkservicemesh/api/pkg/api/registry"
@@ -69,10 +70,13 @@ type Config struct {
 	ConnectTo        url.URL           `default:"unix:///var/lib/networkservicemesh/nsm.io.sock" desc:"url to connect to" split_words:"true"`
 	MaxTokenLifetime time.Duration     `default:"10m" desc:"maximum lifetime of tokens" split_words:"true"`
 	ServiceNames     []string          `default:"icmp-responder" desc:"Name of providing service" split_words:"true"`
-	Payload          string            `default:"ETHERNET" desc:"Name of provided service payload" split_words:"true"`
+	Payload          string            `default:"IP" desc:"Name of provided service payload" split_words:"true"`
 	Labels           map[string]string `default:"" desc:"Endpoint labels"`
 	CidrPrefix       string            `default:"169.254.0.0/16" desc:"CIDR Prefix to assign IPs from" split_words:"true"`
 	RegisterService  bool              `default:"true" desc:"if true then registers network service on startup" split_words:"true"`
+	PodIp            string            `default:"0.0.0.0" desc:"Pod IP, status.podIP" split_words:"true"`
+	DoSetupDefaultRoute bool           `default:"false" desc:"if true then the NSE will set itself as the default route to the CIDR prefix in connections" split_words:"true"`
+	PeerNses         bool              `default:"false" desc:"if true then the NSE will attempt to find and connect to other NSEs" split_words:"true"`
 }
 
 // Process prints and processes env to config
@@ -149,34 +153,45 @@ func main() {
 	// ********************************************************************************
 	log.FromContext(ctx).Infof("executing phase 3: creating icmp server ipam")
 	// ********************************************************************************
-	baseip, ipnet, err := net.ParseCIDR(config.CidrPrefix)
+	ipnet, err := getIpamCidrPrefix(config)
 	if err != nil {
 		log.FromContext(ctx).Fatalf("error parsing cidr: %+v", err)
 	}
-
+	_, routeCidr, err := net.ParseCIDR(config.CidrPrefix)
+	if err != nil {
+		log.FromContext(ctx).Fatalf("error parsing route cidr: %+v", err)
+	}
 	// ********************************************************************************
 	log.FromContext(ctx).Infof("executing phase 4: create icmp-server network service endpoint")
 	// ********************************************************************************
 	vppConn, vppErrCh := vpphelper.StartAndDialContext(ctx)
 	exitOnErr(ctx, cancel, vppErrCh)
 
+	logrus.Infof("routecidr %s", routeCidr)
+	vl3NseServerChain := []networkservice.NetworkServiceServer{
+		// exclude the network IP address
+		vl3_nse.NewVl3IpExcludeServer(ipnet, ipnet.IP),
+		point2pointipam.NewServer(ipnet),
+	}
+	if config.DoSetupDefaultRoute {
+		vl3NseServerChain = append(vl3NseServerChain, vl3_nse.NewServer(routeCidr))
+	}
+	vl3NseServerChain = append(vl3NseServerChain,
+		mechanisms.NewServer(map[string]networkservice.NetworkServiceServer{
+			memif.MECHANISM: chain.NewNetworkServiceServer(
+				sendfd.NewServer(),
+				up.NewServer(ctx, vppConn),
+				connectioncontext.NewServer(vppConn),
+				tag.NewServer(ctx, vppConn),
+				memif.NewServer(vppConn),
+			),
+		}))
 	responderEndpoint := endpoint.NewServer(ctx,
 		spiffejwt.TokenGeneratorFunc(source, config.MaxTokenLifetime),
 		endpoint.WithName(config.Name),
 		endpoint.WithAuthorizeServer(authorize.NewServer()),
 		endpoint.WithAdditionalFunctionality(
-			vl3_nse.NewVl3IpExcludeServer(ipnet, baseip),
-			point2pointipam.NewServer(ipnet),
-			vl3_nse.NewServer(ipnet),
-			mechanisms.NewServer(map[string]networkservice.NetworkServiceServer{
-				memif.MECHANISM: chain.NewNetworkServiceServer(
-					sendfd.NewServer(),
-					up.NewServer(ctx, vppConn),
-					connectioncontext.NewServer(vppConn),
-					tag.NewServer(ctx, vppConn),
-					memif.NewServer(vppConn),
-				),
-			}),
+			vl3NseServerChain...
 		),
 	)
 	// ********************************************************************************
@@ -260,9 +275,13 @@ func main() {
 	// ********************************************************************************
 	log.FromContext(ctx).Infof("executing post-reg phase: discover and peer NSEs")
 	// ********************************************************************************
-	nsePeering := vl3_nse.NewNsePeering(config.ServiceNames[0], nse.Name, source, vppConn,
-		config.ConnectTo, 2*time.Minute, config.MaxTokenLifetime)
-	nsePeering.DoNSEPeering(nseRegistryClient)
+	if config.PeerNses {
+		nsePeering := vl3_nse.NewNsePeering(config.ServiceNames[0], nse.Name, source, vppConn,
+			config.ConnectTo, 2*time.Minute, config.MaxTokenLifetime)
+		nsePeering.DoNSEPeering(nseRegistryClient)
+	} else {
+		logrus.Infof("NSE peering disabled via configuration.")
+	}
 
 	// wait for server to exit
 	<-ctx.Done()
@@ -293,4 +312,35 @@ func notifyContext() (context.Context, context.CancelFunc) {
 		syscall.SIGTERM,
 		syscall.SIGQUIT,
 	)
+}
+
+func getIpamCidrPrefix(config *Config) (*net.IPNet, error) {
+	//baseip, ipnet, err := net.ParseCIDR(config.CidrPrefix)
+
+	_, ipnet, err := net.ParseCIDR(config.CidrPrefix)
+	if err != nil {
+		return nil, err
+	}
+	if config.PodIp != "0.0.0.0" {
+		podIP := net.ParseIP(config.PodIp)
+		if podIP != nil {
+			ipnet = mungeIpamCidrPrefixFromPodIp(ipnet, podIP)
+		}
+	}
+
+	return ipnet, nil
+}
+
+func mungeIpamCidrPrefixFromPodIp(ipamPrefix *net.IPNet, podIP net.IP) (*net.IPNet) {
+	// hardcode for now to assume whole prefix is /16
+	prefixPool := fmt.Sprintf("%d.%d.%d.%d/24",
+		ipamPrefix.IP.To4()[0],
+		ipamPrefix.IP.To4()[1],
+		podIP.To4()[3],
+		0)
+	_, ipamCidr, err := net.ParseCIDR(prefixPool)
+	if err != nil {
+		return ipamPrefix
+	}
+	return ipamCidr
 }
